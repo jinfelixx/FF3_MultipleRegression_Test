@@ -14,8 +14,7 @@ def fetch_ff3_data(start_date, end_date):
     ff_data = pd.DataFrame(ff_data[0]) / 100
     return(ff_data)
 
-# fetches monthly relative returns for specified timeframe using yfinance. Can be transformed into stock data loader by removing
-# bottom code
+# fetches monthly relative returns for specified timeframe using yfinance.
 def rel_returns(ticker_symbol, start_date, end_date):
     resample_logic = {"Open" : "first",
                       "High" : "max",
