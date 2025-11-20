@@ -6,65 +6,118 @@ import pandas as pd
 import pandas_datareader as web
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+import datetime
 
-# fetches per-month FF3 Factor data for specified timeframe using Ken French library
-def fetch_ff3_data(start_date, end_date):
+def get_date(start_date, end_date=None):
+    '''
+    fetches dates for ff3 and stock data.
+    deploy this function to reduce complexity/potential misalignment of data
+    Formatting for dates: "YYYY-MM-DD"
+    '''
+    if end_date == None:
+        end_date = datetime.datetime.now()
+    else:
+        end_date = pd.to_datetime(end_date)
+
+    start_date = pd.to_datetime(start_date)
+
+    return start_date, end_date
+
+def fetch_ff3_data(start_date, end_date="None"):
+    '''
+    Fetching FF3 Factor data for a given timeframe using Ken French API
+    '''
+    start_date, end_date = get_date(start_date, end_date)
     ff_data = web.DataReader('F-F_Research_Data_Factors', 'famafrench', start=start_date, end=end_date)
     del(ff_data["DESCR"], ff_data[1])
     ff_data = pd.DataFrame(ff_data[0]) / 100
     return(ff_data)
 
-# fetches monthly relative returns for specified timeframe using yfinance.
-def rel_returns(ticker_symbol, start_date, end_date):
-    resample_logic = {"Open" : "first",
-                      "High" : "max",
-                      "Low" : "min",
-                      "Close": "last",
-                      "Volume" : "sum",
-                     }
-    data = yf.Ticker(ticker_symbol).history(start = start_date, end = end_date)
-    monthly_data = data.resample("ME").agg(resample_logic)
-    monthly_returns = monthly_data["Close"].pct_change().dropna()
-    monthly_returns.columns = "Relative Returns"
-    return(monthly_returns)
 
-# requires array of stock we want to test to compute excess returns
-def excess_returns(arr):
-    arr.index = ff3.index
-    Y = arr - ff3.iloc[:,3]
-    return Y
+def fetch_stock(stock_ticker, start_date, end_date="None"):
+    '''
+    fetching daily stock returns, which are then converted to monthly stock data in order to match ff3 data
+    '''
+    start_date, end_date = get_date(start_date, end_date)
+    resample_logic = {"Close": "last"}
 
-# creates dataframe for regressors from FF3 data
-def reg_X():
-    X = ff3.iloc[:,0:3]
-    X = sm.add_constant(X)
-    return X
+    daily = yf.Ticker(stock_ticker).history(start=start_date, end=end_date)
 
-# Creates multiple regression for Stock and regressors; also adding constant for intercept
-def OLS_Regression(Stock, X):
-    model = sm.OLS(Stock, X)
-    results = model.fit()
-    return results.summary()
+    monthly = daily.resample("M").agg(resample_logic).to_period("M")
 
-# Function for plotting Data; may be used for stock or FF3
+    monthly_returns = monthly.pct_change().dropna()
+    return monthly_returns
 
-def stock_plot(arr, title, labelx, labely, grid_stat=True):
+def prep_stocks(ticker_list, start_date, end_date):
+    '''
+    Function that creates dataframe that summarises the returns for a list of provided stock tickers
+    '''
+    new_df = pd.concat((fetch_stock(i, start_date, end_date) for i in ticker_list), axis = 1)
+    new_df.columns = ticker_list
+    return new_df
+
+
+def reg_prep(stock_df, ff3_data):
+    '''
+    Creating a function that cleans and prepares our stock data for regression
+    '''
+    joined_df = stock_df.join(ff3_data, how="inner")
+
+    stock_cols = stock_df.columns
+    ff3_cols = ff3_data.columns[:-1]
+
+    joined_df[stock_cols] = joined_df[stock_cols].sub(joined_df["RF"], axis=0)
+
+    Y = joined_df[stock_cols]
+    X = sm.add_constant(joined_df[ff3_cols])
+    return X, Y
+
+def regress(X, Y):
+    '''
+    Creates dictionary that stores the regression summaries for every stock contained in Returns Y
+    Prints Summary statistics for regression.
+    '''
+    regression_data = {}
+    for i in Y.columns:
+        model = sm.OLS(Y[i], X)
+        results = model.fit()
+        regression_data[i] = results
+    [print(regression_data[j].summary()) for j in regression_data]
+    return regression_data
+
+
+def stock_plot(Y, title="Stock Alpha", xlabel="Date", ylabel="Returns", grid=True):
+    '''
+    plots any dataframe of stocks
+    x-axis default: date (PeriodIndex: "YYYY-MM"
+    y-axis default: Stock Alpha (in percent)
+    '''
+
     if not isinstance(title, str):
         raise TypeError(f"Expected String input, instead received {type(title)}")
-    if not isinstance(labelx, str):
-        raise TypeError(f"Expected String input, instead received {type(labelx)}")
-    if not isinstance(labely, str):
-        raise TypeError(f"Expected String input, instead received {type(labely)}")
-    if not isinstance(grid_stat, bool):
-        raise TypeError(f"Expected True or False, instead received {type(grid_stat)}")
+    if not isinstance(xlabel, str):
+        raise TypeError(f"Expected String input, instead received {type(xlabel)}")
+    if not isinstance(ylabel, str):
+        raise TypeError(f"Expected String input, instead received {type(ylabel)}")
+    if not isinstance(grid, bool):
+        raise TypeError(f"Expected True or False, instead received {type(grid)}")
 
-    x_axis = np.linspace(start=arr.index.year[1], stop=arr.index.year[-1], num=arr.index.year.size)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(x_axis, arr)
+    # plt.figure(figsize=(10, 6)) - not necessary
+    Y.plot(figsize=(10,6))
     plt.title(title)
-    plt.ylabel(labely)
-    plt.xlabel(labelx)
-    plt.grid(grid_stat)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(grid)
     plt.show()
 
+
+#test execution block:
+
+tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+
+start, end = get_date("2020-12-31")
+ff3 = fetch_ff3_data(start, end)
+stock_data = prep_stocks(tickers, start, end) # if fetch stocks, theres an error I think if used a list
+X, Y = reg_prep(stock_data, ff3)
+regress(X=X, Y=Y)
+stock_plot(Y)
