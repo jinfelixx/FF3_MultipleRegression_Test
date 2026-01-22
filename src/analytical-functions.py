@@ -1,5 +1,6 @@
-# importing necessary libraries:
+# importing requirements
 
+import setuptools
 import yfinance as yf
 import numpy as np
 import pandas as pd
@@ -8,11 +9,14 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 import datetime
 
-def get_date(start_date, end_date=None):
+def get_date(start_date, end_date = None):
     '''
     fetches dates for ff3 and stock data.
     deploy this function to reduce complexity/potential misalignment of data
     Formatting for dates: "YYYY-MM-DD"
+
+    if end date is empty, end date will be today
+    provides start and end date
     '''
     if end_date == None:
         end_date = datetime.datetime.now()
@@ -23,9 +27,10 @@ def get_date(start_date, end_date=None):
 
     return start_date, end_date
 
-def fetch_ff3_data(start_date, end_date="None"):
+def fetch_ff3_data(start_date, end_date = None):
     '''
-    Fetching FF3 Factor data for a given timeframe using Ken French API
+    Fetching FF3 Factor data for a given timeframe using Ken French API as well as the get_date function
+    Output will be a timeseries dataframe with relative monthly returns for ff3 data
     '''
     start_date, end_date = get_date(start_date, end_date)
     ff_data = web.DataReader('F-F_Research_Data_Factors', 'famafrench', start=start_date, end=end_date)
@@ -34,90 +39,109 @@ def fetch_ff3_data(start_date, end_date="None"):
     return(ff_data)
 
 
-def fetch_stock(stock_ticker, start_date, end_date="None"):
+# Efficiency on the download may be improved at the for loop
+
+def get_portfolio(ticker_list, start_date, end_date=None):
     '''
-    fetching daily stock returns, which are then converted to monthly stock data in order to match ff3 data
+    Creates a Dataframe that contains monthly returns for all portfolios
+    Input data should be a dict of the following form:
+
+    {
+    "Portfolio i" : [Tickers],
+    "Portfolio i+1" : [Tickers]
+    }
+    1. takes start and end date via get_date
+    2. creates empty portfolio dictionary
+    3. For loop
+        a. download every portfolio in specified date range
+        b. create a series with only the closing prices
+        c. resample closing prices to monthly returns, further changing the DateTimeIndex to PeriodIndex
+        d. compute monthly returns, dropping all NA
+        e. appending portfolio average returns to portfolio_dict
+    4. returns Portfolio Dataframe
     '''
     start_date, end_date = get_date(start_date, end_date)
-    resample_logic = {"Close": "last"}
 
-    daily = yf.Ticker(stock_ticker).history(start=start_date, end=end_date)
+    portfolio_dict = {}
 
-    monthly = daily.resample("M").agg(resample_logic).to_period("M")
+    for x in ticker_list.keys():
+        daily = yf.download(ticker_list[x], start=start_date, end=end_date)
 
-    monthly_returns = monthly.pct_change().dropna()
-    return monthly_returns
+        close = daily["Close"]
 
-def prep_stocks(ticker_list, start_date, end_date):
-    '''
-    Function that creates dataframe that summarises the returns for a list of provided stock tickers
-    '''
-    new_df = pd.concat((fetch_stock(i, start_date, end_date) for i in ticker_list), axis = 1)
-    new_df.columns = ticker_list
-    return new_df
+        monthly_close = close.resample("ME").agg("last").to_period("M")
+
+        monthly_returns = monthly_close.pct_change().dropna()
+
+        portfolio_dict[x] = monthly_returns.mean(axis=1)
+
+    return pd.DataFrame(portfolio_dict)
 
 
-def reg_prep(stock_df, ff3_data):
+def timeseries_prep(portfolio_df, ff3_data):
     '''
     Creating a function that cleans and prepares our stock data for regression
-    '''
-    joined_df = stock_df.join(ff3_data, how="inner")
 
-    stock_cols = stock_df.columns
+    1. Create joined dataframe that connects portfolio data with ff3 data using pd.join(how = "inner") to align time series data
+    2. Save column names to separate later on
+    3. Risk free returns are subtracted from portfolio returns
+    4. Add Constant to FF3-Regressor Matrix
+    5. Joined DF is now again separated into regression ready X and Y variables
+    '''
+    joined_df = portfolio_df.join(ff3_data, how="inner")
+
+    portfolio_cols = portfolio_df.columns
     ff3_cols = ff3_data.columns[:-1]
 
-    joined_df[stock_cols] = joined_df[stock_cols].sub(joined_df["RF"], axis=0)
+    joined_df[portfolio_cols] = joined_df[portfolio_cols].sub(joined_df["RF"], axis=0)
 
-    Y = joined_df[stock_cols]
-    X = sm.add_constant(joined_df[ff3_cols])
-    return X, Y
+    portfolio_excess_returns = joined_df[portfolio_cols]
+    risk_factors = sm.add_constant(joined_df[ff3_cols])
+    return portfolio_excess_returns, risk_factors
 
-def regress(X, Y):
+
+def timeseries(portfolio_excess_returns, risk_factors):
     '''
-    Creates dictionary that stores the regression summaries for every stock contained in Returns Y
-    Prints Summary statistics for regression.
+    time series regression to compute the factor loadings
+    stores factor_loadings which is essentially the beta matrix that is needed for the cross sectional regression
+    jensen alpha also stored
+
+    1. store model parameters
+    2. save column names
+    3. transpose parameter matrix, renaming the columns
+    4. extract factor_loadings and jensen_alpha
+
     '''
-    regression_data = {}
-    for i in Y.columns:
-        model = sm.OLS(Y[i], X)
-        results = model.fit()
-        regression_data[i] = results
-    [print(regression_data[j].summary()) for j in regression_data]
-    return regression_data
+    model = sm.OLS(portfolio_excess_returns, risk_factors)
+    results = model.fit()
+
+    factor_loadings_t = results.params
+    factor_loadings_t.columns = portfolio_excess_returns.columns
+
+    factor_loadings_total = factor_loadings_t.T
+    new_columns = list(factor_loadings_total.columns)
+    new_columns[0] = "jensen_alpha"
+    factor_loadings_total.columns = new_columns
+
+    factor_loadings = factor_loadings_total.iloc[:,1:]
+    jensen_alpha = factor_loadings_total.iloc[:,0]
+
+    return factor_loadings, jensen_alpha
 
 
-def stock_plot(Y, title="Stock Alpha", xlabel="Date", ylabel="Returns", grid=True):
+def crosssection(portfolio_excess_returns, factor_loadings):
     '''
-    plots any dataframe of stocks
-    x-axis default: date (PeriodIndex: "YYYY-MM"
-    y-axis default: Stock Alpha (in percent)
+    prepare the betas for regression; Since OLS takes the Form BETA = (X'X)^-1 X' and betas stay constant in this regression,
+    we will use this attribute to compute the regression instead.
+
+
     '''
+    betas = sm.add_constant(factor_loadings)
 
-    if not isinstance(title, str):
-        raise TypeError(f"Expected String input, instead received {type(title)}")
-    if not isinstance(xlabel, str):
-        raise TypeError(f"Expected String input, instead received {type(xlabel)}")
-    if not isinstance(ylabel, str):
-        raise TypeError(f"Expected String input, instead received {type(ylabel)}")
-    if not isinstance(grid, bool):
-        raise TypeError(f"Expected True or False, instead received {type(grid)}")
+    cols = betas.columns
+    projection_matrix = np.linalg.inv(betas.T @ betas) @ betas.T
+    gammas = projection_matrix @ portfolio_excess_returns.T
 
-    # plt.figure(figsize=(10, 6)) - not necessary
-    Y.plot(figsize=(10,6))
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.grid(grid)
-    plt.show()
-
-
-#test execution block:
-
-tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-
-start, end = get_date("2020-12-31")
-ff3 = fetch_ff3_data(start, end)
-stock_data = prep_stocks(tickers, start, end) # if fetch stocks, theres an error I think if used a list
-X, Y = reg_prep(stock_data, ff3)
-regress(X=X, Y=Y)
-stock_plot(Y)
+    gammas.index = cols
+    gammas = gammas.T
+    return gammas
